@@ -40,12 +40,17 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
     // The write side can wait on this to ensure shutdown has completed.
     readonly Task _runLoop;
 
+    // Batches larger than this are rare enough that growing into them on demand is preferable to reserving the space.
+    const int MaxPreallocatedBatchCapacity = 65536;
+    // Used when the loop has failed and even the backoff delay could not be created; sleeping is allocation-free.
+    static readonly TimeSpan LoopFailureFallbackBackoff = TimeSpan.FromSeconds(1);
+
     // Used only by the read side.
     readonly IBatchedLogEventSink _targetSink;
     readonly int _batchSizeLimit;
     readonly bool _eagerlyEmitFirstEvent;
     readonly FailureAwareBatchScheduler _batchScheduler;
-    readonly Queue<LogEvent> _currentBatch = new();
+    readonly Queue<LogEvent> _currentBatch;
     readonly Task _waitForShutdownSignal;
     Task<bool>? _cachedWaitToRead;
     ILoggingFailureListener _failureListener = SelfLog.FailureListener;
@@ -69,6 +74,10 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
 
         _targetSink = batchedSink ?? throw new ArgumentNullException(nameof(batchedSink));
         _batchSizeLimit = options.BatchSizeLimit;
+        // Sized up-front so that filling a batch never has to grow the backing array. Under memory pressure that
+        // growth is the most likely allocation in the read loop to fail, and an exception storm (the usual company
+        // of an `OutOfMemoryException`) is exactly when the batch first grows larger than it ever has before.
+        _currentBatch = new Queue<LogEvent>(Math.Min(_batchSizeLimit, MaxPreallocatedBatchCapacity));
         _queue = options.QueueLimit is { } limit
             ? Channel.CreateBounded<LogEvent>(new BoundedChannelOptions(limit) { SingleReader = true })
             : Channel.CreateUnbounded<LogEvent>(new UnboundedChannelOptions { SingleReader = true });
@@ -110,59 +119,91 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
         var isEagerBatch = _eagerlyEmitFirstEvent;
         do
         {
-            // Code from here through to the `try` block is expected to be infallible. It's structured this way because
-            // any failure modes within it haven't been accounted for in the rest of the sink design, and would need
-            // consideration in order for the sink to function robustly (i.e. to avoid hot/infinite looping).
-
-            var fillBatch = Task.Delay(_batchScheduler.NextInterval);
-            do
-            {
-                while (_currentBatch.Count < _batchSizeLimit &&
-                       !_shutdownSignal.IsCancellationRequested &&
-                       _queue.Reader.TryRead(out var next))
-                {
-                    _currentBatch.Enqueue(next);
-                }
-            } while ((_currentBatch.Count < _batchSizeLimit && !isEagerBatch || _currentBatch.Count == 0) &&
-                     !_shutdownSignal.IsCancellationRequested &&
-                     await TryWaitToReadAsync(_queue.Reader, fillBatch, _shutdownSignal.Token).ConfigureAwait(false));
-
+            // Nothing between here and the inner `try` is exception-free: growing the batch, creating the delay task
+            // and waiting on the channel all allocate, so under memory pressure any of them can throw
+            // `OutOfMemoryException`. An exception escaping this loop would fault the task with nothing observing it
+            // until disposal, while `Emit()` kept queueing events that nothing reads. The outer `catch` keeps the
+            // loop alive: it reports the failure, backs off, and tries again.
+            Task? fillBatch = null;
             try
             {
-                if (_currentBatch.Count == 0)
+                fillBatch = Task.Delay(_batchScheduler.NextInterval);
+                do
                 {
-                    await _targetSink.OnEmptyBatchAsync().ConfigureAwait(false);
+                    while (_currentBatch.Count < _batchSizeLimit &&
+                           !_shutdownSignal.IsCancellationRequested &&
+                           _queue.Reader.TryRead(out var next))
+                    {
+                        _currentBatch.Enqueue(next);
+                    }
+                } while ((_currentBatch.Count < _batchSizeLimit && !isEagerBatch || _currentBatch.Count == 0) &&
+                         !_shutdownSignal.IsCancellationRequested &&
+                         await TryWaitToReadAsync(_queue.Reader, fillBatch, _shutdownSignal.Token).ConfigureAwait(false));
+
+                try
+                {
+                    if (_currentBatch.Count == 0)
+                    {
+                        await _targetSink.OnEmptyBatchAsync().ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        isEagerBatch = false;
+
+                        await EmitCurrentBatchAsync().ConfigureAwait(false);
+
+                        _currentBatch.Clear();
+                        _batchScheduler.MarkSuccess();
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    isEagerBatch = false;
+                    ReportFailure(LoggingFailureKind.Temporary, "failed emitting a batch", _currentBatch, ex);
+                    _batchScheduler.MarkFailure(out var shouldDropBatch, out var shouldDropQueue);
 
-                    await EmitCurrentBatchAsync().ConfigureAwait(false);
+                    if (shouldDropBatch)
+                    {
+                        ReportFailure(LoggingFailureKind.Permanent, "dropping the current batch", _currentBatch, ex);
+                        _currentBatch.Clear();
+                    }
 
-                    _currentBatch.Clear();
-                    _batchScheduler.MarkSuccess();
+                    if (shouldDropQueue)
+                    {
+                        DrainOnFailure(LoggingFailureKind.Permanent, "dropping all queued events", ex);
+                    }
+
+                    // Wait out the remainder of the batch fill time so that we don't overwhelm the server. With each
+                    // successive failure the interval will increase. Needs special handling so that we don't need to
+                    // make `fillBatch` cancellable (and thus fallible).
+                    await Task.WhenAny(fillBatch, _waitForShutdownSignal).ConfigureAwait(false);
                 }
             }
             catch (Exception ex)
             {
-                _failureListener.OnLoggingFailed(this, LoggingFailureKind.Temporary, "failed emitting a batch", _currentBatch, ex);
                 _batchScheduler.MarkFailure(out var shouldDropBatch, out var shouldDropQueue);
+                ReportFailure(shouldDropBatch ? LoggingFailureKind.Permanent : LoggingFailureKind.Temporary,
+                    "the batching loop failed", _currentBatch, ex);
 
                 if (shouldDropBatch)
                 {
-                    _failureListener.OnLoggingFailed(this, LoggingFailureKind.Permanent, "dropping the current batch", _currentBatch, ex);
                     _currentBatch.Clear();
                 }
 
                 if (shouldDropQueue)
                 {
-                    DrainOnFailure(LoggingFailureKind.Permanent, "dropping all queued events", ex);
+                    // Draining allocates. If allocation is what has been failing, there is nothing more to be done this
+                    // time round; the scheduler will ask again after the next failure.
+                    try
+                    {
+                        DrainOnFailure(LoggingFailureKind.Permanent, "dropping all queued events", ex);
+                    }
+                    catch
+                    {
+                        // Nothing left that can report it.
+                    }
                 }
 
-                // Wait out the remainder of the batch fill time so that we don't overwhelm the server. With each
-                // successive failure the interval will increase. Needs special handling so that we don't need to
-                // make `fillBatch` cancellable (and thus fallible).
-                await Task.WhenAny(fillBatch, _waitForShutdownSignal).ConfigureAwait(false);
+                await BackOffAfterLoopFailureAsync(fillBatch).ConfigureAwait(false);
             }
         }
         while (!_shutdownSignal.IsCancellationRequested);
@@ -195,7 +236,7 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
         }
         catch (Exception ex)
         {
-            _failureListener.OnLoggingFailed(this, LoggingFailureKind.Permanent, "dropping the current batch", _currentBatch, ex);
+            ReportFailure(LoggingFailureKind.Permanent, "dropping the current batch", _currentBatch, ex);
             DrainOnFailure(LoggingFailureKind.Final, "failed emitting a batch during shutdown; dropping remaining queued events", ex, ignoreShutdownSignal: true);
         }
     }
@@ -236,6 +277,44 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
         return false;
     }
 
+    // Failure listeners are user-supplied, and the default one formats strings; neither can be allowed to take the
+    // read loop down with it, nor to escape `Dispose()` before the target sink has been disposed. Every call to the
+    // listener goes through here.
+    void ReportFailure(LoggingFailureKind kind, string message, IReadOnlyCollection<LogEvent>? events, Exception? exception)
+    {
+        try
+        {
+            _failureListener.OnLoggingFailed(this, kind, message, events, exception);
+        }
+        catch (Exception listenerException)
+        {
+            try
+            {
+                SelfLog.WriteLine("Failure listener {0} threw {1} while reporting: {2}", _failureListener, listenerException, exception);
+            }
+            catch
+            {
+                // Nothing left that can report it.
+            }
+        }
+    }
+
+    async Task BackOffAfterLoopFailureAsync(Task? fillBatch)
+    {
+        try
+        {
+            // `fillBatch` carries the normal post-failure wait; if the failure happened before it was created, build an
+            // equivalent one from the scheduler, which has already been told about the failure and will back off.
+            await Task.WhenAny(fillBatch ?? Task.Delay(_batchScheduler.NextInterval), _waitForShutdownSignal).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Even the delay could not be created. Sleeping allocates nothing and keeps a persistent failure from
+            // becoming a hot loop; disposal is delayed by at most this much.
+            Thread.Sleep(LoopFailureFallbackBackoff);
+        }
+    }
+
     void DrainOnFailure(LoggingFailureKind kind, string message, Exception? exception, bool ignoreShutdownSignal = false)
     {
         const int bufferLimit = 1024;
@@ -250,12 +329,12 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
 
             if (buffer.Count == bufferLimit)
             {
-                _failureListener.OnLoggingFailed(this, kind, message, buffer, exception);
+                ReportFailure(kind, message, buffer, exception);
                 buffer.Clear();
             }
         }
 
-        _failureListener.OnLoggingFailed(this, kind, message, buffer, exception);
+        ReportFailure(kind, message, buffer, exception);
     }
 
     // Wait until `reader` has items to read. Returns `false` if the `timeout` task completes, or if the reader is cancelled.
@@ -270,7 +349,7 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
         // read task cancellation exceptions during shutdown, may be some room to improve.
         if (completed is { Exception: not null, IsCanceled: false })
         {
-            _failureListener.OnLoggingFailed(this, LoggingFailureKind.Temporary, "could not read from queue", events: null, completed.Exception);
+            ReportFailure(LoggingFailureKind.Temporary, "could not read from queue", events: null, completed.Exception);
         }
 
         if (completed == timeout)
@@ -309,7 +388,7 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
         {
             // E.g. the task was canceled before ever being run, or internally failed and threw
             // an unexpected exception.
-            _failureListener.OnLoggingFailed(this, LoggingFailureKind.Final, "caught exception during disposal", events: null, ex);
+            ReportFailure(LoggingFailureKind.Final, "caught exception during disposal", events: null, ex);
         }
 
         (_targetSink as IDisposable)?.Dispose();
@@ -329,7 +408,7 @@ sealed class BatchingSink : ILogEventSink, IDisposable, ISetLoggingFailureListen
             {
                 // E.g. the task was canceled before ever being run, or internally failed and threw
                 // an unexpected exception.
-                _failureListener.OnLoggingFailed(this, LoggingFailureKind.Final, "caught exception during async disposal", events: null, ex);
+                ReportFailure(LoggingFailureKind.Final, "caught exception during async disposal", events: null, ex);
             }
 
             if (_targetSink is IAsyncDisposable asyncDisposable)

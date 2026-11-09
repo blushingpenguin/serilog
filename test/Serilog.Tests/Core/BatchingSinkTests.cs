@@ -79,6 +79,93 @@ public class BatchingSinkTests
     }
 
     [Fact]
+    public void AThrowingFailureListenerDoesNotStopTheLoop()
+    {
+        // Failure listeners are user-supplied and run in the read loop's failure path. One that throws must not
+        // fault the loop task; `Emit()` would otherwise keep queueing events that are never read.
+        var bs = new FailOnceBatchedSink();
+        var pbs = new BatchingSink(bs, new() { BatchSizeLimit = 1, BufferingTimeLimit = MicroWait, EagerlyEmitFirstEvent = true });
+        pbs.SetFailureListener(new ThrowingFailureListener());
+
+        var evt = Some.InformationEvent();
+        pbs.Emit(evt);
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (bs.Batches.Count == 0 && DateTime.UtcNow < deadline)
+            Thread.Sleep(MicroWait);
+
+        pbs.Dispose();
+
+        var batch = Assert.Single(bs.Batches);
+        Assert.Same(evt, Assert.Single(batch));
+    }
+
+    [Fact]
+    public void AnExceptionOutsideBatchEmissionDoesNotStopTheLoop()
+    {
+        // `Task.Delay()` rejects intervals beyond roughly 49 days, so with this buffering time limit the first
+        // statement of every loop iteration throws - standing in for the `OutOfMemoryException` that can surface
+        // from any statement there under memory pressure. The loop must survive it, so that the queued event is
+        // still flushed on disposal.
+        var bs = new InMemoryBatchedSink(TimeSpan.Zero);
+        var pbs = new BatchingSink(bs, new() { BatchSizeLimit = 2, BufferingTimeLimit = TimeSpan.FromDays(60) });
+
+        var evt = Some.InformationEvent();
+        pbs.Emit(evt);
+        Thread.Sleep(TinyWait);
+        pbs.Dispose();
+
+        var batch = Assert.Single(bs.Batches);
+        Assert.Same(evt, Assert.Single(batch));
+    }
+
+    [Fact]
+    public void AThrowingFailureListenerDoesNotPreventDisposalWhenTheShutdownFlushFails()
+    {
+        // The shutdown flush reports a failed batch to the listener. A listener that throws from that report must
+        // not fault the loop task, nor escape `Dispose()` before the target sink has been disposed.
+        var bs = new AlwaysFailingBatchedSink();
+        var pbs = new BatchingSink(bs, new() { BatchSizeLimit = 1, BufferingTimeLimit = TimeSpan.FromDays(1), EagerlyEmitFirstEvent = true });
+        pbs.SetFailureListener(new ThrowingFailureListener());
+
+        // With a batch size of one, the first event fills the batch and fails; the second waits in the queue for the
+        // shutdown flush to find.
+        pbs.Emit(Some.InformationEvent());
+        pbs.Emit(Some.InformationEvent());
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (bs.Calls == 0 && DateTime.UtcNow < deadline)
+            Thread.Sleep(MicroWait);
+
+        pbs.Dispose();
+
+        Assert.True(bs.Calls >= 2);
+        Assert.True(bs.IsDisposed);
+    }
+
+#if FEATURE_ASYNCDISPOSABLE
+    [Fact]
+    public async Task AThrowingFailureListenerDoesNotPreventAsyncDisposalWhenTheShutdownFlushFails()
+    {
+        var bs = new AlwaysFailingBatchedSink();
+        var pbs = new BatchingSink(bs, new() { BatchSizeLimit = 1, BufferingTimeLimit = TimeSpan.FromDays(1), EagerlyEmitFirstEvent = true });
+        pbs.SetFailureListener(new ThrowingFailureListener());
+
+        pbs.Emit(Some.InformationEvent());
+        pbs.Emit(Some.InformationEvent());
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (bs.Calls == 0 && DateTime.UtcNow < deadline)
+            Thread.Sleep(MicroWait);
+
+        await pbs.DisposeAsync();
+
+        Assert.True(bs.Calls >= 2);
+        Assert.True(bs.IsDisposed);
+    }
+#endif
+
+    [Fact]
     public void ExecutionContextDoesNotFlowToBatchedSink()
     {
         var local = new AsyncLocal<int>
